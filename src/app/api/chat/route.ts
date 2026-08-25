@@ -27,19 +27,32 @@ export async function POST(req: NextRequest) {
     });
 
     const jinaData = await jinaResponse.json();
+    
+    if (!jinaData.data || jinaData.data.length === 0) {
+      console.error('[Chat] Jina Error:', jinaData);
+      return NextResponse.json({ error: 'Failed to create query embedding.' }, { status: 500 });
+    }
+    
     const queryEmbedding = jinaData.data[0].embedding;
 
-    // 2. Get Pinecone Host URL dynamically
+    // 2. Query Pinecone via REST API
     const pineconeKey = process.env.PINECONE_API_KEY!;
     const indexName = 'enterprise-rag';
     
     const descRes = await fetch(`https://api.pinecone.io/indexes/${indexName}`, {
       headers: { 'Api-Key': pineconeKey, 'X-Pinecone-API-Version': '2024-07' }
     });
+    
     const descData = await descRes.json();
+    
+    // FIX: Check if Pinecone returned an error (like index paused)
+    if (!descRes.ok || !descData.host) {
+      console.error('[Chat] PINECONE ERROR:', descData);
+      return NextResponse.json({ error: 'Pinecone index might be paused or missing. Check your Pinecone dashboard.' }, { status: 500 });
+    }
+    
     const host = descData.host;
 
-    // 3. Query Pinecone via REST API
     const queryRes = await fetch(`https://${host}/query`, {
       method: 'POST',
       headers: {
@@ -49,18 +62,27 @@ export async function POST(req: NextRequest) {
       },
       body: JSON.stringify({
         vector: queryEmbedding,
-        topK: 3,
+        topK: 5,
         includeMetadata: true,
       })
     });
 
     const queryData = await queryRes.json();
 
-    // 4. Extract the context text
+    // 3. Extract the context text
     const context = queryData.matches?.map((match: any) => match.metadata?.text).join('\n\n---\n\n') || '';
 
-    // 5. Construct the LLM prompt
-    const systemPrompt = `You are an enterprise assistant. Answer the user's question based ONLY on the following context. If the context doesn't contain the answer, say "I don't have enough information in the provided documents to answer that."
+    // 4. Construct the LLM prompt
+    const systemPrompt = `You are an enterprise assistant. Answer the user's question based ONLY on the following context. 
+    
+    FORMATTING RULES:
+    - You MUST format your response in beautiful, clean Markdown.
+    - Use bullet points (-) for lists.
+    - Use **bold text** for key terms or important concepts.
+    - Use ### headings to separate different topics if applicable.
+    - Keep paragraphs short and readable.
+    
+    If the context doesn't contain the answer, say "I don't have enough information in the provided documents to answer that."
     
     Context:
     ${context}`;
@@ -70,11 +92,11 @@ export async function POST(req: NextRequest) {
       ...messages.slice(-3)
     ];
 
-    // 6. Call Groq for the final answer
+    // 5. Call Groq for the final answer
     const completion = await groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
       messages: fullMessages,
-      temperature: 0.1,
+      temperature: 0.2,
     });
 
     const reply = completion.choices[0].message.content;
@@ -82,7 +104,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ reply });
 
   } catch (error: any) {
-    console.error('RAG Chat Error:', error);
+    console.error('[Chat] RAG Catch Block Error:', error);
     return NextResponse.json({ error: 'Failed to generate answer' }, { status: 500 });
   }
 }

@@ -6,56 +6,78 @@ export const runtime = 'nodejs';
 export async function POST(req: NextRequest) {
   try {
     const formData = await req.formData();
-    const file = formData.get('pdf') as File;
+    const files = formData.getAll('pdf') as File[];
     
-    if (!file) {
-      return NextResponse.json({ error: 'No file uploaded' }, { status: 400 });
+    if (files.length === 0) {
+      return NextResponse.json({ error: 'No files uploaded' }, { status: 400 });
     }
 
-    // 1. Extract text from PDF
-    const bytes = await file.arrayBuffer();
-    const buffer = new Uint8Array(bytes);
-    const pdf = await getDocumentProxy(buffer);
-    const { text } = await extractText(pdf, { mergePages: true });
+    let allVectors: any[] = [];
+    let totalChunks = 0;
 
-    console.log(`[Ingest] Extracted ${text?.length || 0} characters from PDF.`);
+    for (const file of files) {
+      const bytes = await file.arrayBuffer();
+      const buffer = new Uint8Array(bytes);
+      const pdf = await getDocumentProxy(buffer);
+      const { text } = await extractText(pdf, { mergePages: true });
 
-    if (!text || text.trim().length < 10) {
-      return NextResponse.json({ error: 'No readable text found in PDF.' }, { status: 400 });
+      if (!text || text.trim().length < 10) {
+        console.log(`[Ingest] No text found in ${file.name}, skipping.`);
+        continue; 
+      }
+
+      // Truncate to 100,000 chars to prevent Vercel timeouts on massive PDFs
+      const maxChars = 100000;
+      const truncatedText = text.length > maxChars ? text.substring(0, maxChars) : text;
+
+      const chunkSize = 1500;
+      const chunks: string[] = []; 
+      for (let i = 0; i < truncatedText.length; i += chunkSize) {
+        const chunkText = `[Source: ${file.name}]\n${truncatedText.slice(i, i + chunkSize)}`;
+        chunks.push(chunkText);
+      }
+      totalChunks += chunks.length;
+
+      console.log(`[Ingest] Processing ${chunks.length} chunks for ${file.name}...`);
+
+      const jinaResponse = await fetch('https://api.jina.ai/v1/embeddings', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.JINA_API_KEY}`
+        },
+        body: JSON.stringify({
+          model: 'jina-embeddings-v2-base-en',
+          input: chunks,
+        })
+      });
+
+      const jinaData = await jinaResponse.json();
+
+      if (!jinaData.data || jinaData.data.length === 0) {
+        console.error(`[Ingest] Jina API Error for ${file.name}:`, jinaData);
+        continue;
+      }
+
+      const vectors = jinaData.data.map((item: any, i: number) => ({
+        id: `chunk-${file.name}-${i}-${Date.now()}`,
+        values: item.embedding,
+        metadata: {
+          text: chunks[i],
+          source: file.name,
+        },
+      }));
+
+      allVectors = [...allVectors, ...vectors];
     }
 
-    // 2. Chunk the text
-    const chunkSize = 1000;
-    const chunks: string[] = []; 
-    for (let i = 0; i < text.length; i += chunkSize) {
-      chunks.push(text.slice(i, i + chunkSize));
+    if (allVectors.length === 0) {
+      return NextResponse.json({ error: 'Could not extract text or generate embeddings for the uploaded PDFs.' }, { status: 500 });
     }
 
-    console.log(`[Ingest] Created ${chunks.length} chunks.`);
+    console.log(`[Ingest] Upserting ${allVectors.length} total vectors to Pinecone via REST API...`);
 
-    // 3. Create embeddings using Jina AI
-    const jinaResponse = await fetch('https://api.jina.ai/v1/embeddings', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.JINA_API_KEY}`
-      },
-      body: JSON.stringify({
-        model: 'jina-embeddings-v2-base-en',
-        input: chunks,
-      })
-    });
-
-    const jinaData = await jinaResponse.json();
-
-    if (!jinaData.data || jinaData.data.length === 0) {
-      console.error('[Ingest] Jina API Error:', jinaData);
-      return NextResponse.json({ error: 'Jina API failed to return embeddings.' }, { status: 500 });
-    }
-
-    console.log(`[Ingest] Received ${jinaData.data.length} embeddings from Jina.`);
-
-    // 4. Get Pinecone Host URL dynamically
+    // FIX: Bypass Pinecone SDK entirely to avoid Next.js Webpack bundler bug
     const pineconeKey = process.env.PINECONE_API_KEY!;
     const indexName = 'enterprise-rag';
     
@@ -70,19 +92,6 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Failed to connect to Pinecone.' }, { status: 500 });
     }
 
-    // 5. Prepare vectors for raw REST upsert
-    const vectors = jinaData.data.map((item: any, i: number) => ({
-      id: `chunk-${i}-${Date.now()}`,
-      values: item.embedding,
-      metadata: {
-        text: chunks[i],
-        source: file.name,
-      },
-    }));
-
-    console.log(`[Ingest] Prepared ${vectors.length} vectors. Upserting via REST API...`);
-
-    // 6. Upsert directly to Pinecone REST API (Bypassing SDK entirely)
     const upsertRes = await fetch(`https://${host}/vectors/upsert`, {
       method: 'POST',
       headers: {
@@ -90,7 +99,7 @@ export async function POST(req: NextRequest) {
         'X-Pinecone-API-Version': '2024-07',
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({ vectors: vectors })
+      body: JSON.stringify({ vectors: allVectors })
     });
 
     const upsertData = await upsertRes.json();
@@ -100,15 +109,15 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Pinecone rejected the upsert.' }, { status: 500 });
     }
 
-    console.log(`[Ingest] Successfully indexed ${vectors.length} chunks to Pinecone.`);
+    console.log(`[Ingest] Successfully indexed ${totalChunks} chunks to Pinecone.`);
 
     return NextResponse.json({ 
       success: true, 
-      message: `Indexed ${vectors.length} chunks from ${file.name}` 
+      message: `Indexed ${totalChunks} chunks from ${files.length} document(s).` 
     });
 
   } catch (error: any) {
     console.error('Ingestion Error:', error);
-    return NextResponse.json({ error: 'Failed to process PDF' }, { status: 500 });
+    return NextResponse.json({ error: 'Failed to process PDFs' }, { status: 500 });
   }
 }
