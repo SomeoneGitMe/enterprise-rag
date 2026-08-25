@@ -14,6 +14,7 @@ export default function Home() {
   const [isLoading, setIsLoading] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [fileNames, setFileNames] = useState<string[]>([]);
+  const [activePdf, setActivePdf] = useState<string | null>(null); 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -23,7 +24,14 @@ export default function Home() {
     setIsUploading(true);
     
     const names = Array.from(files).map(f => f.name);
-    setFileNames(names);
+    
+    setFileNames(prev => {
+      const combined = [...new Set([...prev, ...names])];
+      if (combined.length > 5) {
+        return combined.slice(combined.length - 5);
+      }
+      return combined;
+    });
 
     const formData = new FormData();
     Array.from(files).forEach(file => {
@@ -38,7 +46,7 @@ export default function Home() {
       const data = await res.json();
       
       if (data.success) {
-        setMessages([{ role: 'assistant', content: `Successfully indexed ${names.length} document(s). You can now ask questions across all of them.` }]);
+        setMessages([{ role: 'assistant', content: `Successfully indexed ${names.length} document(s). You can now ask questions across all of them, or select a specific document above.` }]);
       } else {
         setMessages([{ role: 'assistant', content: `Error: ${data.error}` }]);
       }
@@ -47,6 +55,42 @@ export default function Home() {
       setMessages([{ role: 'assistant', content: "Failed to upload documents." }]);
     } finally {
       setIsUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  const handleDeleteFile = async (fileName: string) => {
+    // Optimistically remove from UI
+    const remainingFiles = fileNames.filter(f => f !== fileName);
+    setFileNames(remainingFiles);
+    
+    // If the deleted file was active, reset to All Documents
+    if (activePdf === fileName) {
+      setActivePdf(null);
+    }
+
+    try {
+      await fetch('/api/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fileName })
+      });
+      setMessages([{ role: 'assistant', content: `Removed ${fileName} from the database.` }]);
+    } catch (error) {
+      console.error('Delete error:', error);
+    }
+  };
+
+  const handleClearAll = async () => {
+    setFileNames([]);
+    setActivePdf(null);
+    setMessages([]);
+
+    try {
+      await fetch('/api/reset');
+      setMessages([{ role: 'assistant', content: "All documents cleared. Upload a new PDF to begin." }]);
+    } catch (error) {
+      console.error('Clear All error:', error);
     }
   };
 
@@ -64,7 +108,10 @@ export default function Home() {
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: newMessages }),
+        body: JSON.stringify({ 
+          messages: newMessages,
+          fileContext: activePdf 
+        }),
       });
       
       const data = await res.json();
@@ -87,8 +134,20 @@ export default function Home() {
       <div className="w-full max-w-3xl flex flex-col h-[90vh] bg-zinc-900 rounded-2xl shadow-xl border border-zinc-800 overflow-hidden">
         
         <div className="bg-zinc-950 p-6 border-b border-zinc-800">
-          <h1 className="text-2xl font-bold text-white mb-1">Enterprise RAG Knowledge Base</h1>
-          <p className="text-sm text-zinc-400 mb-4">Upload multiple PDFs and ask questions across all of them.</p>
+          <div className="flex justify-between items-center mb-4">
+            <div>
+              <h1 className="text-2xl font-bold text-white mb-1">Enterprise RAG Knowledge Base</h1>
+              <p className="text-sm text-zinc-400">Upload up to 5 PDFs and ask questions across all of them, or target specific ones.</p>
+            </div>
+            {fileNames.length > 0 && (
+              <button 
+                onClick={handleClearAll} 
+                className="bg-zinc-800 hover:bg-red-900/50 text-zinc-400 hover:text-red-400 px-3 py-1.5 rounded-lg text-xs font-semibold transition border border-zinc-700"
+              >
+                Clear All
+              </button>
+            )}
+          </div>
           
           <div className="flex items-center gap-4">
             <input 
@@ -106,12 +165,34 @@ export default function Home() {
             >
               {isUploading ? 'Indexing...' : 'Upload PDFs'}
             </button>
-            {fileNames.length > 0 && (
-              <span className="text-xs text-zinc-500 truncate">
-                {isUploading ? `Processing ${fileNames.length} files...` : `Loaded: ${fileNames.join(', ')}`}
-              </span>
-            )}
           </div>
+
+          {fileNames.length > 0 && (
+            <div className="flex flex-wrap gap-2 mt-4">
+              <button 
+                onClick={() => setActivePdf(null)} 
+                className={`px-3 py-1 rounded-full text-xs font-semibold transition ${activePdf === null ? 'bg-blue-600 text-white' : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'}`}
+              >
+                All Documents
+              </button>
+              {fileNames.map((name, idx) => (
+                <div key={idx} className={`group flex items-center rounded-full text-xs font-semibold transition ${activePdf === name ? 'bg-blue-600 text-white' : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'}`}>
+                  <button 
+                    onClick={() => setActivePdf(name)} 
+                    className="px-3 py-1 truncate max-w-[120px]"
+                  >
+                    {name}
+                  </button>
+                  <button 
+                    onClick={() => handleDeleteFile(name)} 
+                    className="px-2 py-1 border-l border-white/10 hover:bg-red-600 rounded-r-full opacity-0 group-hover:opacity-100 transition"
+                  >
+                    ✕
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         <div className="flex-1 overflow-y-auto p-6 space-y-4 bg-zinc-900">
@@ -145,7 +226,7 @@ export default function Home() {
           {isLoading && (
             <div className="flex justify-start">
               <div className="bg-zinc-800 border border-zinc-700 text-zinc-400 p-4 rounded-xl animate-pulse text-sm">
-                Searching documents...
+                {activePdf ? `Searching ${activePdf}...` : 'Searching all documents...'}
               </div>
             </div>
           )}
@@ -155,7 +236,7 @@ export default function Home() {
           <input
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder="Ask about the documents..."
+            placeholder={activePdf ? `Ask about ${activePdf}...` : "Ask about the documents..."}
             className="flex-1 bg-zinc-900 text-white px-4 py-3 rounded-xl outline-none border border-zinc-800 focus:border-blue-500 text-sm"
           />
           <button type="submit" disabled={isLoading} className="bg-blue-600 hover:bg-blue-700 px-6 py-3 rounded-xl font-semibold text-white disabled:opacity-50 text-sm">

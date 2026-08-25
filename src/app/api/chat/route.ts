@@ -1,19 +1,15 @@
+// app/api/chat/route.ts
 import { NextRequest, NextResponse } from 'next/server';
-import OpenAI from 'openai';
+import { getDynamicModel } from '@/lib/ai-router';
 
 export const runtime = 'nodejs';
 
-const groq = new OpenAI({
-  apiKey: process.env.GROQ_API_KEY!,
-  baseURL: "https://api.groq.com/openai/v1"
-});
-
 export async function POST(req: NextRequest) {
   try {
-    const { messages } = await req.json();
-    const lastMessage = messages[messages.length - 1].content;
+    const { messages, fileContext } = await req.json();
+    const userQuery = messages[messages.length - 1].content;
 
-    // 1. Create embedding for the user's question using Jina AI
+    // 1. Generate query embedding using Jina
     const jinaResponse = await fetch('https://api.jina.ai/v1/embeddings', {
       method: 'POST',
       headers: {
@@ -22,38 +18,24 @@ export async function POST(req: NextRequest) {
       },
       body: JSON.stringify({
         model: 'jina-embeddings-v2-base-en',
-        input: [lastMessage],
+        input: [userQuery],
       })
     });
 
     const jinaData = await jinaResponse.json();
-    
-    if (!jinaData.data || jinaData.data.length === 0) {
-      console.error('[Chat] Jina Error:', jinaData);
-      return NextResponse.json({ error: 'Failed to create query embedding.' }, { status: 500 });
-    }
-    
-    const queryEmbedding = jinaData.data[0].embedding;
+    const queryVector = jinaData.data[0].embedding;
 
-    // 2. Query Pinecone via REST API
+    // 2. Query Pinecone
     const pineconeKey = process.env.PINECONE_API_KEY!;
     const indexName = 'enterprise-rag';
     
     const descRes = await fetch(`https://api.pinecone.io/indexes/${indexName}`, {
       headers: { 'Api-Key': pineconeKey, 'X-Pinecone-API-Version': '2024-07' }
     });
-    
     const descData = await descRes.json();
-    
-    // FIX: Check if Pinecone returned an error (like index paused)
-    if (!descRes.ok || !descData.host) {
-      console.error('[Chat] PINECONE ERROR:', descData);
-      return NextResponse.json({ error: 'Pinecone index might be paused or missing. Check your Pinecone dashboard.' }, { status: 500 });
-    }
-    
     const host = descData.host;
 
-    const queryRes = await fetch(`https://${host}/query`, {
+    const pineconeResponse = await fetch(`https://${host}/query`, {
       method: 'POST',
       headers: {
         'Api-Key': pineconeKey,
@@ -61,50 +43,77 @@ export async function POST(req: NextRequest) {
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        vector: queryEmbedding,
+        vector: queryVector,
         topK: 5,
         includeMetadata: true,
+        filter: fileContext ? { source: { $eq: fileContext } } : undefined,
       })
     });
 
-    const queryData = await queryRes.json();
-
-    // 3. Extract the context text
-    const context = queryData.matches?.map((match: any) => match.metadata?.text).join('\n\n---\n\n') || '';
-
-    // 4. Construct the LLM prompt
-    const systemPrompt = `You are an enterprise assistant. Answer the user's question based ONLY on the following context. 
+    const pineconeData = await pineconeResponse.json();
     
-    FORMATTING RULES:
-    - You MUST format your response in beautiful, clean Markdown.
-    - Use bullet points (-) for lists.
-    - Use **bold text** for key terms or important concepts.
-    - Use ### headings to separate different topics if applicable.
-    - Keep paragraphs short and readable.
-    
-    If the context doesn't contain the answer, say "I don't have enough information in the provided documents to answer that."
-    
-    Context:
-    ${context}`;
+    // 3. Assemble strict RAG context
+    const contextText = pineconeData.matches
+      .map((match: any) => match.metadata.text)
+      .join('\n\n---\n\n');
 
-    const fullMessages = [
-      { role: "system", content: systemPrompt },
-      ...messages.slice(-3)
-    ];
+    // 4. PROOF: Log the exact text being retrieved from Pinecone
+    console.log('\n--- [RAG RETRIEVAL] ---');
+    console.log('User Query:', userQuery);
+    console.log('Retrieved Context:\n', contextText);
+    console.log('-----------------------\n');
 
-    // 5. Call Groq for the final answer
-    const completion = await groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
-      messages: fullMessages,
-      temperature: 0.2,
+    if (!contextText || contextText.trim().length < 10) {
+      return NextResponse.json({ 
+        reply: "I couldn't find any information about that in the selected PDF." 
+      });
+    }
+
+    // 5. Dynamic Model Selection
+    const modelId = await getDynamicModel();
+
+    // 6. Strict System Prompt
+    const systemPrompt = `You are an elite RAG AI assistant. You must answer the user's question STRICTLY using the provided context. 
+    If the context does not contain the information necessary to answer the question, you must explicitly state: "The provided context does not contain information about this." 
+    DO NOT use any outside knowledge, pre-trained data, or assumptions. 
+    DO NOT reference the filenames or the structure of the text. 
+    Synthesize the answer professionally and directly from the text below.
+
+    CONTEXT:
+    ${contextText}`;
+
+    // 7. Call Groq via native fetch
+    const chatResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: modelId,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          ...messages.slice(0, -1), 
+          { role: 'user', content: userQuery }
+        ],
+        temperature: 0.1,
+        max_tokens: 2000,
+      }),
     });
 
-    const reply = completion.choices[0].message.content;
+    if (!chatResponse.ok) {
+      const errorData = await chatResponse.json();
+      console.error('[Chat] Groq API Error:', errorData);
+      throw new Error('Groq chat completion failed');
+    }
+    
+    const chatData = await chatResponse.json();
+    const reply = chatData.choices[0].message.content;
 
-    return NextResponse.json({ reply });
+    return NextResponse.json({ reply, modelUsed: modelId });
 
   } catch (error: any) {
-    console.error('[Chat] RAG Catch Block Error:', error);
-    return NextResponse.json({ error: 'Failed to generate answer' }, { status: 500 });
+    console.error('[Chat Error]', error);
+    return NextResponse.json({ error: error.message }, { status: 500 });
   }
 }

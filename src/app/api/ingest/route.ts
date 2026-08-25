@@ -1,3 +1,4 @@
+// app/api/ingest/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import { extractText, getDocumentProxy } from 'unpdf';
 
@@ -32,9 +33,10 @@ export async function POST(req: NextRequest) {
 
       const chunkSize = 1500;
       const chunks: string[] = []; 
+      
+      // Removed [Source: filename] prefix from text to prevent LLM bias/hallucination
       for (let i = 0; i < truncatedText.length; i += chunkSize) {
-        const chunkText = `[Source: ${file.name}]\n${truncatedText.slice(i, i + chunkSize)}`;
-        chunks.push(chunkText);
+        chunks.push(truncatedText.slice(i, i + chunkSize));
       }
       totalChunks += chunks.length;
 
@@ -77,7 +79,6 @@ export async function POST(req: NextRequest) {
 
     console.log(`[Ingest] Upserting ${allVectors.length} total vectors to Pinecone via REST API...`);
 
-    // FIX: Bypass Pinecone SDK entirely to avoid Next.js Webpack bundler bug
     const pineconeKey = process.env.PINECONE_API_KEY!;
     const indexName = 'enterprise-rag';
     
